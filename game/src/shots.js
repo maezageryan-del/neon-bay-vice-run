@@ -1,79 +1,109 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The deterministic screenshot scenes behind ?shot=start|play|chase|mission.
+// Each scene drives the REAL world with the REAL step function — staging only
+// sets up positions, wanted level and mission state, then simulates a few
+// seconds so traffic, pedestrians and police are mid-action, exactly as in
+// play. Same seed, same frame, every time.
+import { STEP } from './config.js';
+import { SCREEN_COMPLETE, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const IDLE = { ax: 0, ay: 0, run: false };
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function run(world, seconds, input = IDLE, actions = 0) {
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) world.step(STEP, input, i === 0 ? actions : 0);
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+/** Put the player in the nearest car and return that car. */
+function enterNearestCar(world) {
+  const s = world.state;
+  let best = null; let bd = Infinity;
+  for (const c of s.cars) {
+    const d = Math.hypot(c.x - s.player.x, c.y - s.player.y);
+    if (d < bd) { bd = d; best = c; }
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  if (best) {
+    s.player.x = best.x; s.player.y = best.y;
+    world.step(STEP, IDLE, 1); // ACTION_INTERACT
   }
-  return best;
+  return s.player.inCar;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Stage the named scene in `world` and return { screen, save } for the
+ * renderer. Names: start, play, chase, mission (anything else is start).
  */
 export function stageShot(name, world) {
+  const s = world.state;
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+
+  if (name === 'play') {
+    // Driving through traffic on a main road, first mission active: put the
+    // stolen car squarely on the northbound avenue so the frame is motion,
+    // traffic and city — not a car nosed into a building.
+    world.startMission();
+    const car = enterNearestCar(world);
+    if (car) {
+      car.x = 772; car.y = 1960; car.angle = -Math.PI / 2; car.speed = 255;
+      s.player.x = car.x; s.player.y = car.y;
+    }
+    run(world, 2.0, { ax: 0, ay: -1, run: false });
+    s.cash = 370;
+    return { screen: SCREEN_PLAY, save: null };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'chase') {
+    // Three-star police chase: player driving the avenue, units framed
+    // behind and beside, light damage smoke trailing.
+    world.startMission();
+    const car = enterNearestCar(world);
+    if (car) {
+      car.x = 772; car.y = 2060; car.angle = -Math.PI / 2; car.speed = 320;
+      car.smoke = 0.4; car.health = 72;
+      s.player.x = car.x; s.player.y = car.y;
+    }
+    world.setWanted(3);
+    run(world, 0.3, { ax: 0, ay: -1, run: false }); // lets the units spawn
+    // Frame the pursuit around the northbound player car: two units behind
+    // (south), one alongside on the next lane, one ahead turning in.
+    const spots = [
+      { dx: -48, dy: 190 }, { dx: 52, dy: 300 }, { dx: 118, dy: 30 }, { dx: -30, dy: -260 },
+    ];
+    s.police.forEach((cop, i) => {
+      const spot = spots[i % spots.length];
+      cop.x = s.player.x + spot.dx;
+      cop.y = s.player.y + spot.dy;
+      cop.angle = -Math.PI / 2;
+      cop.speed = 300;
+    });
+    run(world, 0.55, { ax: 0.06, ay: -1, run: false });
+    s.cash = 620;
+    return { screen: SCREEN_PLAY, save: null };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'mission') {
+    // The delivery moment: car at the Neon Garage, mission complete panel.
+    world.startMission();
+    const car = enterNearestCar(world);
+    if (car) {
+      car.x = s.landmarks.garage.x + 30;
+      car.y = s.landmarks.garage.y + 46;
+      car.angle = 0.3;
+      car.speed = 0;
+      s.player.x = car.x; s.player.y = car.y;
+    }
+    run(world, 0.4, IDLE);
+    // The step into the garage zone completes M1 if the staging lined up;
+    // force the complete state either way so the panel is what renders.
+    if (s.missionState !== 'complete') {
+      s.cash += 250;
+      s.missionState = 'complete';
+      s.banner = '';
+      s.bannerTimer = 0;
+    }
+    return { screen: SCREEN_COMPLETE, save: null };
+  }
+
+  // start: title over the dusk city, traffic drifting behind the panel.
+  run(world, 3, IDLE);
+  return { screen: SCREEN_TITLE, save: { bestCash: 1250, missionsDone: 2 } };
 }
